@@ -117,10 +117,7 @@ class TestCLIInterface:
                 args, _ = mock_save.call_args
                 assert args[0] == "test"
                 assert args[1].window_id == "12345"
-                assert (
-                    args[1].app_path
-                    == "/System/Applications/Utilities/Terminal.app"
-                )
+                assert args[1].app_path == "/System/Applications/Utilities/Terminal.app"
 
         finally:
             # Restore original state
@@ -331,6 +328,7 @@ class TestCoreWorkflows:
             assert mock_flock.called
             assert session_file.read_text() == old_content
 
+
 class TestDataParsing:
     """Test HookData dataclass parsing and validation."""
 
@@ -495,6 +493,7 @@ class TestRemoteMode:
 
         assert idle_time == 25
 
+
 class TestTmuxSessionDetection:
     """Test tmux session ID capture and attachment checking."""
 
@@ -521,6 +520,7 @@ class TestTmuxSessionDetection:
             result = cc_notifier.get_tmux_session_id()
 
         assert result is None
+
 
 class TestTitleFormat:
     """Test customizable title format via CC_NOTIFIER_TITLE_FORMAT."""
@@ -896,9 +896,7 @@ class TestCmdNotifyDispatch:
         )
         cc_notifier.save_session_state(session_id, state)
 
-    def test_silent_decision_sends_no_notification(
-        self, tmp_path, monkeypatch
-    ):
+    def test_silent_decision_sends_no_notification(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
         self._state_file()
         with (
@@ -916,9 +914,7 @@ class TestCmdNotifyDispatch:
         mock_local.assert_not_called()
         mock_push.assert_not_called()
 
-    def test_local_decision_sends_terminal_notifier(
-        self, tmp_path, monkeypatch
-    ):
+    def test_local_decision_sends_terminal_notifier(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
         self._state_file()
         with (
@@ -963,9 +959,7 @@ class TestCmdNotifyDispatch:
         mock_local.assert_not_called()
         mock_push.assert_called_once()
 
-    def test_push_decision_without_credentials_is_noop(
-        self, tmp_path, monkeypatch
-    ):
+    def test_push_decision_without_credentials_is_noop(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
         self._state_file()
         with (

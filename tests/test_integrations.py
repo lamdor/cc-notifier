@@ -221,9 +221,7 @@ class TestTmuxListClients:
 
     def test_returns_empty_when_tmux_not_found(self):
         """tmux binary missing -> empty list."""
-        with patch(
-            "cc_notifier.subprocess.run", side_effect=FileNotFoundError()
-        ):
+        with patch("cc_notifier.subprocess.run", side_effect=FileNotFoundError()):
             result = cc_notifier.tmux_list_clients("$3")
             assert result == []
 
@@ -264,9 +262,7 @@ class TestIsFocusedGhostty:
                 return_value={"/dev/ttys012", "/dev/ttys015"},
             ),
         ):
-            assert (
-                cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is True
-            )
+            assert cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is True
 
     def test_returns_false_when_client_tty_not_in_tree(self):
         """Different Ghostty window has focus."""
@@ -277,9 +273,7 @@ class TestIsFocusedGhostty:
                 return_value={"/dev/ttys020"},
             ),
         ):
-            assert (
-                cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
-            )
+            assert cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
 
     def test_returns_false_when_hammerspoon_fails(self):
         """Hammerspoon error -> conservative LOCAL -> return False."""
@@ -287,9 +281,7 @@ class TestIsFocusedGhostty:
             "cc_notifier.get_focused_window_pid",
             side_effect=RuntimeError("no hs"),
         ):
-            assert (
-                cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
-            )
+            assert cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
 
     def test_returns_false_when_no_descendants(self):
         """Focused app isn't a terminal — empty TTY set."""
@@ -297,9 +289,7 @@ class TestIsFocusedGhostty:
             patch("cc_notifier.get_focused_window_pid", return_value=999),
             patch("cc_notifier.walk_descendant_ttys", return_value=set()),
         ):
-            assert (
-                cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
-            )
+            assert cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
 
 
 class TestWalkDescendantTtys:

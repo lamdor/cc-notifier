@@ -688,9 +688,7 @@ def walk_descendant_ttys(root_pid: int) -> set[str]:
         if depth >= PID_WALK_MAX_DEPTH:
             continue
 
-        frontier.extend(
-            (child_pid, depth + 1) for child_pid in _pid_children(pid)
-        )
+        frontier.extend((child_pid, depth + 1) for child_pid in _pid_children(pid))
 
     debug_log(f"Descendant TTYs for pid={root_pid}: {ttys}")
     return ttys
@@ -712,9 +710,7 @@ def is_focused_ghostty_for_tty(client_tty: str) -> bool:
 
     ttys = walk_descendant_ttys(pid)
     result = client_tty in ttys
-    debug_log(
-        f"is_focused_ghostty_for_tty(pid={pid}, tty={client_tty}) = {result}"
-    )
+    debug_log(f"is_focused_ghostty_for_tty(pid={pid}, tty={client_tty}) = {result}")
     return result
 
 
