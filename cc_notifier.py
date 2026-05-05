@@ -31,9 +31,6 @@ MAX_LOG_LINES = 2250  # Trigger trim when exceeded
 TRIM_TO_LINES = 1250  # Keep newest lines after trim
 HAMMERSPOON_CLI = "/Applications/Hammerspoon.app/Contents/Frameworks/hs/hs"
 TERMINAL_NOTIFIER = "/opt/homebrew/bin/terminal-notifier"
-PUSH_IDLE_CHECK_INTERVALS_DESKTOP = [3, 20]
-PUSH_IDLE_CHECK_INTERVALS_REMOTE = [4]
-PUSH_IDLE_CHECK_INTERVALS_ATTACHED = [3, 20]
 PID_WALK_MAX_DEPTH = 6
 KEYBOARD_IDLE_THRESHOLD_SECONDS = 60
 
@@ -128,7 +125,7 @@ def cmd_init() -> None:
 
 @handle_command_errors("notify")
 def cmd_notify() -> None:
-    """Send intelligent notification if user switched away from original window."""
+    """Send notification based on tmux/focus/idle decision."""
     global _CURRENT_APP_PATH
     hook_data = HookData.from_stdin()
 
@@ -136,35 +133,43 @@ def cmd_notify() -> None:
         return
 
     state = load_session_state(hook_data.session_id)
-    original_window_id = state.window_id
-    tmux_session_id = state.tmux_session_id
-
-    # Set global app path for error handling
     _CURRENT_APP_PATH = state.app_path
 
-    # Local notifications only in desktop mode
-    if not is_remote_session():
+    decision = decide_notification(state)
+    debug_log(f"cmd_notify decision: {decision.value}")
+
+    if decision is Decision.SILENT:
+        return
+
+    title, subtitle, message = create_notification_data(
+        hook_data, for_push=(decision is Decision.PUSH)
+    )
+
+    if decision is Decision.LOCAL:
         try:
-            send_local_notification_if_needed(
-                hook_data, original_window_id, tmux_session_id
+            focus_window_id = (
+                state.window_id
+                if state.window_id not in ("UNAVAILABLE", "REMOTE", "")
+                else None
+            )
+            send_notification(
+                title=title,
+                subtitle=subtitle,
+                message=message,
+                focus_window_id=focus_window_id,
             )
         except (RuntimeError, OSError) as e:
-            log_error("Local notification failed, continuing to push", e)
+            log_error("Local notification failed", e)
+        return
 
-    # Push notifications if configured
+    # decision is Decision.PUSH
     push_config = PushConfig.from_env()
-    if push_config:
-        if tmux_session_id and is_tmux_session_attached(tmux_session_id):
-            debug_log(
-                f"tmux session {tmux_session_id} attached - using extended idle check"
-            )
-            intervals = PUSH_IDLE_CHECK_INTERVALS_ATTACHED
-        elif is_remote_session():
-            intervals = PUSH_IDLE_CHECK_INTERVALS_REMOTE
-        else:
-            intervals = PUSH_IDLE_CHECK_INTERVALS_DESKTOP
-        debug_log(f"Push idle check intervals: {intervals}")
-        check_idle_and_notify_push(hook_data, intervals)
+    if not push_config:
+        debug_log("PUSH decision but no Pushover credentials configured")
+        return
+    push_url = build_push_url(hook_data)
+    debug_log(f"Sending push notification: '{title}'")
+    send_pushover_notification(push_config, title, message, url=push_url)
 
 
 @handle_command_errors("cleanup")
@@ -256,51 +261,6 @@ def check_deduplication(session_id: str) -> bool:
             return False
     except BlockingIOError:
         return True
-
-
-def send_local_notification_if_needed(
-    hook_data: HookData,
-    original_window_id: str,
-    tmux_session_id: str = "",
-) -> None:
-    """Send local notification if user switched away from original window."""
-    # Without Hammerspoon, check tmux session before sending
-    if original_window_id == "UNAVAILABLE":
-        if tmux_session_id and is_tmux_session_attached(tmux_session_id):
-            debug_log(
-                f"Window tracking unavailable but tmux session {tmux_session_id} is attached - suppressing notification"
-            )
-            return
-        debug_log("Window tracking unavailable, sending notification unconditionally")
-        title, subtitle, message = create_notification_data(hook_data)
-        send_notification(title=title, subtitle=subtitle, message=message)
-        return
-
-    current_window_id, _ = get_focused_window_id()
-
-    if original_window_id == current_window_id:
-        # Same window, but check if user switched tmux sessions within it
-        if tmux_session_id and not is_tmux_session_attached(tmux_session_id):
-            debug_log(
-                f"Same window but tmux session {tmux_session_id} detached - user switched tmux sessions"
-            )
-        else:
-            debug_log("User still on original window - no local notification needed")
-            return
-
-    # User switched away - send local notification
-    title, subtitle, message = create_notification_data(hook_data)
-
-    debug_log(
-        f"Sending local notification: original_window={original_window_id}, current_window={current_window_id}, notification='{title}' | '{subtitle}' | '{message}'"
-    )
-
-    send_notification(
-        title=title,
-        subtitle=subtitle,
-        message=message,
-        focus_window_id=original_window_id,
-    )
 
 
 @dataclass
@@ -518,38 +478,6 @@ def get_tmux_window_pane_ids() -> tuple[str, str]:
         return (window_id, pane_id)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return ("", "")
-
-
-def is_tmux_session_attached(session_id: str) -> bool:
-    """Check if a tmux session is currently attached (has active clients).
-
-    Args:
-        session_id: tmux session ID (e.g. '$20')
-
-    Returns:
-        True if attached count > 0, False otherwise.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "tmux",
-                "list-sessions",
-                "-f",
-                f"#{{==:#{{session_id}},{session_id}}}",
-                "-F",
-                "#{session_attached}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            attached_count = int(result.stdout.strip())
-            debug_log(f"tmux session {session_id} attached count: {attached_count}")
-            return attached_count > 0
-        return False
-    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
-        return False
 
 
 @dataclass
@@ -1120,51 +1048,6 @@ def get_idle_time() -> int:
             raise RuntimeError("CC_NOTIFIER_TTY not set by wrapper")
         return tty_atime_idle(tty_path)
     return get_macos_idle_time()
-
-
-def check_idle_and_notify_push(hook_data: HookData, check_times: list[int]) -> None:
-    """Check if user is idle at specified intervals and send push notification if away.
-
-    Simple logic: If idle time is less than elapsed time, user was active during check period.
-    """
-    push_config = PushConfig.from_env()
-    if not push_config:
-        return
-
-    if not check_times:
-        raise ValueError("check_times cannot be empty")
-
-    mode = "remote" if is_remote_session() else "desktop"
-    debug_log(f"Push check started: mode={mode}")
-
-    previous_time = 0
-    for check_time in check_times:
-        time.sleep(check_time - previous_time)
-
-        try:
-            idle_time = get_idle_time()
-            # If idle time < elapsed time, user was active during check period
-            user_active = idle_time < check_time
-
-            debug_log(
-                f"Push check: elapsed={check_time}s, idle={idle_time}s, "
-                f"user_active={user_active}"
-            )
-
-            if user_active:
-                debug_log("Push check exit: User is active")
-                return
-        except RuntimeError as e:
-            debug_log(f"Push check exit: idle detection error ({e})")
-            return
-
-        previous_time = check_time
-
-    # User has been idle through all checks, send push notification
-    title, _, message = create_notification_data(hook_data, for_push=True)
-    push_url = build_push_url(hook_data)
-    debug_log(f"Sending push notification: '{title}'")
-    send_pushover_notification(push_config, title, message, url=push_url)
 
 
 # ============================================================================

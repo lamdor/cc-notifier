@@ -375,14 +375,14 @@ class TestDecideNotification:
     """Exhaustive matrix over the notification decision."""
 
     def _state(self, **overrides):
-        defaults = dict(
-            window_id="99",
-            app_path="/Applications/Ghostty.app",
-            timestamp=0.0,
-            tmux_session_id="$3",
-            tmux_window_id="@42",
-            tmux_pane_id="%87",
-        )
+        defaults = {
+            "window_id": "99",
+            "app_path": "/Applications/Ghostty.app",
+            "timestamp": 0.0,
+            "tmux_session_id": "$3",
+            "tmux_window_id": "@42",
+            "tmux_pane_id": "%87",
+        }
         defaults.update(overrides)
         return cc_notifier.SessionState(**defaults)
 
