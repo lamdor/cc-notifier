@@ -988,6 +988,44 @@ class TestCmdNotifyDispatch:
         mock_push.assert_not_called()
 
 
+class TestNotificationEventOnly:
+    """cc-notifier handles Notification events the same as Stop events."""
+
+    def test_notification_event_uses_message_field(self, tmp_path, monkeypatch):
+        """For Notification hooks, the 'message' from stdin becomes body."""
+        monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
+        state = cc_notifier.SessionState(
+            window_id="99",
+            app_path="/Applications/Ghostty.app",
+            timestamp=0.0,
+            tmux_session_id="$3",
+            tmux_window_id="@42",
+            tmux_pane_id="%87",
+        )
+        cc_notifier.save_session_state("abc", state)
+        stdin_payload = json.dumps(
+            {
+                "session_id": "abc",
+                "cwd": "/tmp",
+                "hook_event_name": "Notification",
+                "message": "Permission needed for Bash",
+            }
+        )
+        with (
+            patch.object(sys, "argv", ["cc-notifier", "notify"]),
+            patch.dict(os.environ, {"CC_NOTIFIER_WRAPPER": "1"}),
+            patch("sys.stdin", StringIO(stdin_payload)),
+            patch(
+                "cc_notifier.decide_notification",
+                return_value=cc_notifier.Decision.LOCAL,
+            ),
+            patch("cc_notifier.send_notification") as mock_local,
+        ):
+            cc_notifier.main()
+        kwargs = mock_local.call_args.kwargs
+        assert kwargs["message"] == "Permission needed for Bash"
+
+
 class TestCmdInitTmuxCapture:
     """Test cmd_init captures tmux window and pane IDs."""
 
