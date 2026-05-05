@@ -9,8 +9,9 @@ interactions and external dependency contracts.
 import os
 import subprocess
 import sys
+import time
 from io import StringIO
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -225,3 +226,27 @@ class TestTmuxListClients:
         ):
             result = cc_notifier.tmux_list_clients("$3")
             assert result == []
+
+
+class TestTtyAtimeIdle:
+    """Test tty_atime_idle with explicit paths."""
+
+    def test_returns_seconds_since_atime(self, tmp_path):
+        """Stat a real file, set atime, get back idle seconds."""
+        f = tmp_path / "fake_tty"
+        f.write_text("")
+        thirty_ago = time.time() - 30
+        os.utime(f, (thirty_ago, time.time()))
+        idle = cc_notifier.tty_atime_idle(str(f))
+        assert 28 <= idle <= 32
+
+    def test_returns_huge_idle_when_path_missing(self):
+        """Missing TTY path -> very large value (treated as idle)."""
+        idle = cc_notifier.tty_atime_idle("/dev/this-does-not-exist")
+        assert idle >= 10**8
+
+    def test_returns_huge_idle_on_oserror(self):
+        """Permission errors etc -> very large value."""
+        with patch("cc_notifier.os.stat", side_effect=PermissionError()):
+            idle = cc_notifier.tty_atime_idle("/dev/ttys012")
+            assert idle >= 10**8

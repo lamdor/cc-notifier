@@ -813,8 +813,7 @@ class TestRemoteMode:
         assert intervals == cc_notifier.PUSH_IDLE_CHECK_INTERVALS_ATTACHED
 
     def test_tty_idle_detection(self):
-        """Test get_tty_idle_time() correctly calculates idle time from TTY st_atime."""
-        # Mock current time and TTY stat
+        """Test tty_atime_idle() correctly calculates idle time from TTY st_atime."""
         current_time = 1234567890
         last_read_time = current_time - 25  # 25 seconds ago
 
@@ -824,11 +823,10 @@ class TestRemoteMode:
         with (
             patch("time.time", return_value=current_time),
             patch("os.stat", return_value=MockStat()),
-            patch.dict(os.environ, {"CC_NOTIFIER_TTY": "/dev/pts/1"}),
         ):
-            idle_time = cc_notifier.get_tty_idle_time()
+            idle_time = cc_notifier.tty_atime_idle("/dev/pts/1")
 
-        assert idle_time == 25  # Should calculate correct idle duration
+        assert idle_time == 25
 
     def test_baseline_idle_detection(self):
         """Test check_idle_and_notify_push() detects user activity during check period."""

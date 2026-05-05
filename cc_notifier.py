@@ -831,33 +831,41 @@ def get_macos_idle_time() -> int:
         raise RuntimeError(f"ioreg command timed out after {e.timeout} seconds") from e
 
 
-def get_tty_idle_time() -> int:
-    """Get TTY idle time in seconds based on last read operation (user input)."""
-    try:
-        # Use TTY path captured by wrapper before backgrounding
-        # This gives us the actual terminal device (works with tmux/screen)
-        tty_path = os.getenv("CC_NOTIFIER_TTY")
-        if not tty_path:
-            raise RuntimeError("CC_NOTIFIER_TTY not set by wrapper")
+TTY_IDLE_HUGE = 10**9  # Sentinel: stat failed, treat client as idle
 
-        debug_log(f"TTY detection: CC_NOTIFIER_TTY={tty_path!r}")
+
+def tty_atime_idle(tty_path: str) -> int:
+    """Get TTY idle time in seconds based on st_atime (last read).
+
+    st_atime advances on read() from the kernel — i.e. when the kernel
+    delivers keyboard or mouse input to a process reading the TTY. It does
+    NOT advance on writes (process output to the terminal). This makes it
+    the correct presence signal even while Claude is streaming output.
+
+    Returns:
+        Seconds since last read on the TTY. Returns TTY_IDLE_HUGE on any
+        stat failure so callers treat the client as idle.
+    """
+    try:
+        debug_log(f"TTY idle stat: path={tty_path}")
         tty_stat = os.stat(tty_path)
-        last_read_time = tty_stat.st_atime
-        current_time = time.time()
-        idle_seconds = int(current_time - last_read_time)
+        idle = int(time.time() - tty_stat.st_atime)
         debug_log(
-            f"TTY idle: path={tty_path}, st_atime={last_read_time:.1f}, current={current_time:.1f}, idle={idle_seconds}s"
+            f"TTY idle: path={tty_path}, atime={tty_stat.st_atime:.1f}, idle={idle}s"
         )
-        return idle_seconds
+        return idle
     except (OSError, ValueError) as e:
-        debug_log(f"TTY idle error: {type(e).__name__}: {e}")
-        raise RuntimeError("Unable to get TTY idle time") from e
+        debug_log(f"TTY idle error for {tty_path}: {type(e).__name__}: {e}")
+        return TTY_IDLE_HUGE
 
 
 def get_idle_time() -> int:
     """Get idle time in seconds, environment-aware."""
     if is_remote_session():
-        return get_tty_idle_time()
+        tty_path = os.getenv("CC_NOTIFIER_TTY")
+        if not tty_path:
+            raise RuntimeError("CC_NOTIFIER_TTY not set by wrapper")
+        return tty_atime_idle(tty_path)
     return get_macos_idle_time()
 
 
