@@ -12,7 +12,10 @@ Primarily a high-level architectural reference, not a detailed implementation gu
 
 ## Key Components
 
-- **Session Files**: `/tmp/cc_notifier/{session_id}` containing window ID, app path, timestamp, and tmux session ID
+- **Session Files**: `/tmp/cc_notifier/{session_id}` containing JSON with
+  fields: `version`, `window_id`, `app_path`, `timestamp`, `tmux_session_id`,
+  `tmux_window_id`, `tmux_pane_id`. The legacy 3-/4-line text format is
+  parsed for backwards compatibility.
 - **Window Management**: Hammerspoon CLI for cross-space window focusing
 - **Local Notifications**: terminal-notifier with `-execute` parameter for click actions
 - **Push Notifications**: Pushover API integration
@@ -23,45 +26,49 @@ Flows are in the order they are executed, and are performed synchronously, unles
 
 ### `cc-notifier init`
 **Trigger**: Claude Code SessionStart hook (Runs when Claude Code starts a new session or resumes an existing session)
-**Purpose**: Capture the currently focused window ID (desktop) or save placeholder (remote)
+**Purpose**: Capture focused window + tmux session/window/pane identifiers
 **Flow**:
 1. Parse session data from stdin JSON
 2. **Desktop Mode**: Get focused window ID via Hammerspoon CLI (`hs.window.focusedWindow()`)
    **Remote Mode**: Use placeholder "REMOTE" (auto-detected via SSH environment variables)
    **Hammerspoon Missing**: Falls back to "UNAVAILABLE" placeholder (graceful degradation)
-3. Capture tmux session ID via `tmux display-message -p '#{session_id}'` (both modes, None if not in tmux)
-4. Save window ID, app path, timestamp, and tmux session ID to `/tmp/cc_notifier/{session_id}`
+3. Capture tmux identifiers (both modes, empty strings if not in tmux):
+   - `tmux_session_id` via `tmux display-message -p '#{session_id}'`
+   - `tmux_window_id` and `tmux_pane_id` via a single `tmux display-message` call
+4. Save SessionState as JSON to `/tmp/cc_notifier/{session_id}`
 5. Exit immediately
 
 ### `cc-notifier notify`
-**Trigger**: Claude Code Stop/Notification hooks (Stop: Runs when the main Claude Code agent has finished responding. Notification: Runs when Claude needs user attention - permission prompts, idle timeouts, auth events, and other notification types)
-**Purpose**: Send intelligent notifications based on environment (local macOS or remote SSH/tmux)
+**Trigger**: Claude Code Notification hook (Runs when Claude needs user attention — permission prompts, idle timeouts, auth events). The Stop hook is intentionally not wired up in dotfiles to avoid notification spam during polling loops; cc-notifier still handles it correctly if a different settings.json wires it up.
+**Purpose**: Send a single mutually-exclusive notification (silent / local / push)
 **Flow**:
 1. Parse hook data from stdin JSON
-2. Load original window ID and tmux session ID from session file
-3. Check deduplication threshold (prevent spam within 2 seconds, preserves tmux session ID)
-4. **Desktop Mode Only**:
-   - If window ID is UNAVAILABLE (no Hammerspoon):
-     - Check if tmux session ID exists and session is attached (`tmux list-sessions` with filter)
-     - If attached: suppress local notification (user is likely viewing Claude Code in tmux)
-     - If detached or no tmux: send local notification unconditionally
-   - If window ID is available:
-     - Get current focused window ID via Hammerspoon CLI
-     - Compare original vs current window ID
-       - Same window + tmux session detached: User switched tmux sessions, send notification
-       - Same window + tmux attached or no tmux: Don't send local notification, continue to push check
-       - Different window: Send local notification via terminal-notifier with click-to-focus
-   - Local notification failures are caught so push notifications still fire
-   - Update session timestamp
-5. **Remote Mode Only**: Skip local notifications entirely
-6. **Push Notifications** (if push credentials exist, both modes):
-   - If tmux session ID exists and session is attached: use attached idle check intervals [3s, 20s] instead of standard intervals
-   - Check idle status using ioreg (desktop) or TTY st_atime (remote)
-   - Progressive interval checks: attached [3s, 20s], desktop [3s, 20s], remote [4s]
-   - At each check: if idle time < elapsed time, user was active during check period
-   - Exit early if user becomes active
-   - Send push via Pushover if idle through all checks
+2. Acquire dedup lock; if another notify ran within 2s, exit silently
+3. Load SessionState from `/tmp/cc_notifier/{session_id}` (JSON; falls back
+   to legacy 3- or 4-line format for sessions that pre-date this version)
+4. Call `decide_notification(state)` → SILENT | LOCAL | PUSH:
+   - `tmux_list_clients(state.tmux_session_id)` → list of attached clients
+   - If none: PUSH
+   - If `min(tty_atime_idle(c.tty) for c in clients) >= 60s`: PUSH
+   - If active client (`client_active=1`) AND focused Ghostty owns its TTY:
+     - If `state.tmux_window_id`/`pane_id` match the current tmux window/pane: SILENT
+     - Else: LOCAL
+   - Else: LOCAL
+5. SILENT → return
+   LOCAL → terminal-notifier with click-to-focus on `state.window_id`
+   PUSH  → Pushover (only when credentials are set)
+6. Session timestamp is updated inside `check_deduplication`
 7. Exit
+
+### Decision constants
+
+- `KEYBOARD_IDLE_THRESHOLD_SECONDS = 60` — clients idle this long are
+  treated as "user away" (PUSH).
+- `PID_WALK_MAX_DEPTH = 6` — bound on the focused-window process tree
+  walk used to map focused PID → controlling TTY.
+
+The previous `PUSH_IDLE_CHECK_INTERVALS_*` constants and progressive
+idle-check ladder are removed. Decision is one-shot.
 
 ### `cc-notifier cleanup`
 **Trigger**: Claude Code SessionEnd hook (Runs when a Claude Code session ends, which can be due to user logout, session clear, or exiting Claude Code while prompt input is visible–i.e. via Ctrl+C)
@@ -100,14 +107,9 @@ Note: Claude Code sends additional fields (e.g., `transcript_path`) that are fil
 **Session Files**
 - Stored in `/tmp/cc_notifier/`
 - Named by session ID (e.g., `/tmp/cc_notifier/abc123`)
-- Format (replace <> with actual values):
-  ```
-  <window_id>
-  <app_path>
-  <unix_timestamp>
-  <tmux_session_id>    (optional, empty string if not in tmux)
-  ```
-- 4th line is optional for backward compatibility — old 3-line session files still work
+- Format: JSON with `version`, `window_id`, `app_path`, `timestamp`,
+  `tmux_session_id`, `tmux_window_id`, `tmux_pane_id`
+- The legacy 3-/4-line text format is parsed for backwards compatibility
 
 **Log Files**
 - Stored in `~/.cc-notifier/cc-notifier.log`
