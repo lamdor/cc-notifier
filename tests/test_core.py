@@ -90,7 +90,11 @@ class TestCLIInterface:
                 patch("cc_notifier.HookData.from_stdin") as mock_stdin,
                 patch("cc_notifier.get_focused_window_id") as mock_window,
                 patch("cc_notifier.get_tmux_session_id", return_value=None),
-                patch("cc_notifier.save_window_id") as mock_save,
+                patch("cc_notifier.save_session_state") as mock_save,
+                patch(
+                    "cc_notifier.get_tmux_window_pane_ids",
+                    return_value=("", ""),
+                ),
                 patch.dict(os.environ, {"CC_NOTIFIER_WRAPPER": "1"}),
             ):
                 # Setup mocks to allow init to complete
@@ -109,8 +113,13 @@ class TestCLIInterface:
                 # Verify the underlying command executed (init was called)
                 mock_stdin.assert_called_once()
                 mock_window.assert_called_once()
-                mock_save.assert_called_once_with(
-                    "test", "12345", "/System/Applications/Utilities/Terminal.app", ""
+                mock_save.assert_called_once()
+                args, _ = mock_save.call_args
+                assert args[0] == "test"
+                assert args[1].window_id == "12345"
+                assert (
+                    args[1].app_path
+                    == "/System/Applications/Utilities/Terminal.app"
                 )
 
         finally:
@@ -212,21 +221,25 @@ class TestCoreWorkflows:
                 return_value=("54321", "/Applications/Visual Studio Code.app"),
             ),
             patch("cc_notifier.get_tmux_session_id", return_value="$20"),
+            patch(
+                "cc_notifier.get_tmux_window_pane_ids",
+                return_value=("@96", "%100"),
+            ),
             patch("sys.stdin", StringIO(json.dumps(test_input))),
             patch.object(sys, "argv", ["cc-notifier", "init"]),
             patch.object(cc_notifier, "SESSION_DIR", session_dir),
             patch.dict(os.environ, {"CC_NOTIFIER_WRAPPER": "1"}),
         ):
             cc_notifier.main()
-
-        # Verify real end-to-end workflow behavior
-        session_file = session_dir / "workflow123"
-        assert session_file.exists()
-        lines = session_file.read_text().strip().split("\n")
-        assert lines[0] == "54321"
-        assert lines[1] == "/Applications/Visual Studio Code.app"
-        assert lines[2] == "0"
-        assert lines[3] == "$20"  # tmux session ID captured
+            session_file = session_dir / "workflow123"
+            assert session_file.exists()
+            loaded = cc_notifier.load_session_state("workflow123")
+        assert loaded.window_id == "54321"
+        assert loaded.app_path == "/Applications/Visual Studio Code.app"
+        assert loaded.timestamp == 0.0
+        assert loaded.tmux_session_id == "$20"
+        assert loaded.tmux_window_id == "@96"
+        assert loaded.tmux_pane_id == "%100"
 
     def test_init_workflow_without_hammerspoon(self, tmp_path):
         """Test init falls back to UNAVAILABLE but still captures tmux session ID."""
@@ -239,20 +252,21 @@ class TestCoreWorkflows:
                 side_effect=RuntimeError("Hammerspoon not found"),
             ),
             patch("cc_notifier.get_tmux_session_id", return_value="$5"),
+            patch(
+                "cc_notifier.get_tmux_window_pane_ids",
+                return_value=("@96", "%100"),
+            ),
             patch("sys.stdin", StringIO(json.dumps(test_input))),
             patch.object(sys, "argv", ["cc-notifier", "init"]),
             patch.object(cc_notifier, "SESSION_DIR", session_dir),
             patch.dict(os.environ, {"CC_NOTIFIER_WRAPPER": "1"}),
         ):
             cc_notifier.main()
-
-        session_file = session_dir / "nohammer"
-        assert session_file.exists()
-        lines = session_file.read_text().strip().split("\n")
-        assert lines[0] == "UNAVAILABLE"
-        assert lines[1] == "UNAVAILABLE"
-        assert lines[2] == "0"
-        assert lines[3] == "$5"  # tmux session ID still captured
+            loaded = cc_notifier.load_session_state("nohammer")
+        assert loaded.window_id == "UNAVAILABLE"
+        assert loaded.app_path == "UNAVAILABLE"
+        assert loaded.timestamp == 0.0
+        assert loaded.tmux_session_id == "$5"
 
     def test_notify_suppressed_when_tmux_attached_without_hammerspoon(self, tmp_path):
         """Test notify suppresses local notification when tmux session is attached."""
@@ -374,13 +388,11 @@ class TestCoreWorkflows:
         ]
         assert len(terminal_notifier_calls) >= 1
         # 3. Session file timestamp was updated
-        content = (session_dir / "notify123").read_text().strip()
-        lines = content.split("\n")
-        assert lines[0] == "original123"  # Window ID unchanged
-        assert (
-            lines[1] == "/System/Applications/Utilities/Terminal.app"
-        )  # App path unchanged
-        assert float(lines[2]) > 0  # Timestamp updated
+        with patch.object(cc_notifier, "SESSION_DIR", session_dir):
+            loaded = cc_notifier.load_session_state("notify123")
+        assert loaded.window_id == "original123"
+        assert loaded.app_path == "/System/Applications/Utilities/Terminal.app"
+        assert loaded.timestamp > 0
 
     def test_notify_workflow_user_stayed_no_notification(self, tmp_path):
         """Test notify workflow when user stayed: JSON input → file read → no notification."""
@@ -417,13 +429,11 @@ class TestCoreWorkflows:
             ]
             assert len(terminal_notifier_calls) == 0
         # 2. Session file timestamp updated (race condition prevention)
-        content = (session_dir / "notify123").read_text().strip()
-        lines = content.split("\n")
-        assert lines[0] == "same123"  # Window ID unchanged
-        assert (
-            lines[1] == "/System/Applications/Utilities/Terminal.app"
-        )  # App path unchanged
-        assert float(lines[2]) > 0  # Timestamp updated to prevent race conditions
+        with patch.object(cc_notifier, "SESSION_DIR", session_dir):
+            loaded = cc_notifier.load_session_state("notify123")
+        assert loaded.window_id == "same123"
+        assert loaded.app_path == "/System/Applications/Utilities/Terminal.app"
+        assert loaded.timestamp > 0
 
     def test_notify_sent_when_same_window_but_tmux_detached(self, tmp_path):
         """Test notify sends notification when same window but tmux session is detached."""
@@ -520,39 +530,35 @@ class TestCoreWorkflows:
             f"Wrapper took {duration_ms:.1f}ms, expected <{MAX_WRAPPER_DURATION_MS}ms"
         )
 
-    def test_file_locking_prevents_race_conditions(self, tmp_path):
+    def test_file_locking_prevents_race_conditions(self, tmp_path, monkeypatch):
         """Test file locking prevents race conditions between concurrent processes."""
-        # Setup session file with 4-line format
+        monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
         session_file = tmp_path / "test_session"
+        # Pre-populate using legacy format to also exercise that path
         session_file.write_text(
             "window123\n/System/Applications/Utilities/Terminal.app\n0\n$20"
         )
 
         # Test 1: Normal operation - should update timestamp and preserve tmux ID
         with patch("fcntl.flock") as mock_flock:
-            result = cc_notifier.check_deduplication(session_file)
-            assert not result  # Should proceed with notification
-            assert mock_flock.called  # Lock was attempted
-            # Verify timestamp was updated and tmux ID preserved
-            content = session_file.read_text()
-            lines = content.split("\n")
-            assert lines[0] == "window123"  # Window ID unchanged
-            assert (
-                lines[1] == "/System/Applications/Utilities/Terminal.app"
-            )  # App path unchanged
-            assert float(lines[2]) > 0  # Timestamp updated
-            assert lines[3] == "$20"  # tmux session ID preserved
+            result = cc_notifier.check_deduplication("test_session")
+            assert not result
+            assert mock_flock.called
+            loaded = cc_notifier.load_session_state("test_session")
+            assert loaded.window_id == "window123"
+            assert loaded.app_path == "/System/Applications/Utilities/Terminal.app"
+            assert loaded.timestamp > 0
+            assert loaded.tmux_session_id == "$20"
 
         # Test 2: Lock contention - should skip gracefully
         session_file.write_text(
             "window123\n/System/Applications/Utilities/Terminal.app\n0\n$20"
-        )  # Reset for second test
+        )
         with patch("fcntl.flock", side_effect=BlockingIOError) as mock_flock:
             old_content = session_file.read_text()
-            result = cc_notifier.check_deduplication(session_file)
-            assert result  # Should skip notification
-            assert mock_flock.called  # Lock was attempted
-            # Verify file unchanged when lock fails
+            result = cc_notifier.check_deduplication("test_session")
+            assert result
+            assert mock_flock.called
             assert session_file.read_text() == old_content
 
     def test_push_uses_extended_intervals_when_tmux_attached_desktop(self, tmp_path):
@@ -659,43 +665,8 @@ class TestDataParsing:
 class TestSessionFileOperations:
     """Test session file creation, reading, and cleanup."""
 
-    def test_save_window_id_creates_file(self):
-        """Test save_window_id() creates directory and saves ID with tmux session."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_session_dir = Path(temp_dir) / "cc_notifier"
-
-            with patch.object(cc_notifier, "SESSION_DIR", temp_session_dir):
-                cc_notifier.save_window_id(
-                    "test_session",
-                    "12345",
-                    "/System/Applications/Utilities/Terminal.app",
-                    "$20",
-                )
-
-            session_file = temp_session_dir / "test_session"
-            assert session_file.exists()
-            assert (
-                session_file.read_text()
-                == "12345\n/System/Applications/Utilities/Terminal.app\n0\n$20"
-            )
-
-    def test_load_window_id_reads_saved_id(self):
-        """Test load_window_id() reads saved window ID correctly."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_session_dir = Path(temp_dir) / "cc_notifier"
-            temp_session_dir.mkdir()
-            session_file = temp_session_dir / "test_session"
-            session_file.write_text(
-                "98765\n/Applications/Visual Studio Code.app\n0\n$5"
-            )
-
-            with patch.object(cc_notifier, "SESSION_DIR", temp_session_dir):
-                window_id = cc_notifier.load_window_id("test_session")
-
-            assert window_id == "98765"
-
-    def test_load_window_id_missing_file_raises_error(self):
-        """Test load_window_id() raises FileNotFoundError when file missing."""
+    def test_load_session_state_missing_file_raises_error(self):
+        """load_session_state raises FileNotFoundError when file missing."""
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_session_dir = Path(temp_dir) / "cc_notifier"
 
@@ -703,7 +674,7 @@ class TestSessionFileOperations:
                 patch.object(cc_notifier, "SESSION_DIR", temp_session_dir),
                 pytest.raises(FileNotFoundError),
             ):
-                cc_notifier.load_window_id("nonexistent_session")
+                cc_notifier.load_session_state("nonexistent_session")
 
 
 class TestRemoteMode:
@@ -734,6 +705,10 @@ class TestRemoteMode:
 
         with (
             patch("cc_notifier.get_tmux_session_id", return_value="$10"),
+            patch(
+                "cc_notifier.get_tmux_window_pane_ids",
+                return_value=("@96", "%100"),
+            ),
             patch("sys.stdin", StringIO(json.dumps(test_input))),
             patch.object(sys, "argv", ["cc-notifier", "init"]),
             patch.object(cc_notifier, "SESSION_DIR", session_dir),
@@ -746,15 +721,11 @@ class TestRemoteMode:
             ),
         ):
             cc_notifier.main()
-
-        # Verify placeholder window ID and tmux session ID were saved
-        session_file = session_dir / "remote123"
-        assert session_file.exists()
-        lines = session_file.read_text().strip().split("\n")
-        assert lines[0] == "REMOTE"
-        assert lines[1] == "REMOTE"
-        assert lines[2] == "0"
-        assert lines[3] == "$10"  # tmux session ID still captured in remote mode
+            loaded = cc_notifier.load_session_state("remote123")
+        assert loaded.window_id == "REMOTE"
+        assert loaded.app_path == "REMOTE"
+        assert loaded.timestamp == 0.0
+        assert loaded.tmux_session_id == "$10"
 
     def test_remote_mode_skips_local_notification(self, tmp_path):
         """Test cmd_notify() skips local notifications in remote mode."""
@@ -1252,3 +1223,35 @@ class TestSessionState:
         )
         cc_notifier.save_session_state("xyz", state)
         assert (target / "xyz").exists()
+
+
+class TestCmdInitTmuxCapture:
+    """Test cmd_init captures tmux window and pane IDs."""
+
+    def test_init_captures_tmux_window_and_pane(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["cc-notifier", "init"]),
+            patch.dict(os.environ, {"CC_NOTIFIER_WRAPPER": "1"}),
+            patch(
+                "cc_notifier.HookData.from_stdin",
+                return_value=cc_notifier.HookData(session_id="sess-123"),
+            ),
+            patch("cc_notifier.is_remote_session", return_value=False),
+            patch(
+                "cc_notifier.get_focused_window_id",
+                return_value=("99", "/Applications/Ghostty.app"),
+            ),
+            patch("cc_notifier.get_tmux_session_id", return_value="$3"),
+            patch(
+                "cc_notifier.get_tmux_window_pane_ids",
+                return_value=("@42", "%87"),
+            ),
+        ):
+            cc_notifier.main()
+
+        loaded = cc_notifier.load_session_state("sess-123")
+        assert loaded.tmux_session_id == "$3"
+        assert loaded.tmux_window_id == "@42"
+        assert loaded.tmux_pane_id == "%87"

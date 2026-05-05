@@ -100,7 +100,7 @@ class TestExternalSystemErrorHandling:
             patch.object(cc_notifier, "SESSION_DIR", session_dir),
             pytest.raises(UnicodeDecodeError),
         ):
-            cc_notifier.load_window_id("test")
+            cc_notifier.load_session_state("test")
 
 
 class TestNotificationSystemIntegration:

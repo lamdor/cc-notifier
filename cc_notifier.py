@@ -100,7 +100,7 @@ def main() -> None:
 
 @handle_command_errors("init")
 def cmd_init() -> None:
-    """Initialize session by capturing focused window ID and app path."""
+    """Initialize session: capture focused window + tmux session/window/pane."""
     hook_data = HookData.from_stdin()
     if is_remote_session():
         window_id, app_path = "REMOTE", "REMOTE"
@@ -112,7 +112,16 @@ def cmd_init() -> None:
             window_id, app_path = "UNAVAILABLE", "UNAVAILABLE"
             debug_log(f"Window capture failed, continuing without: {e}")
     tmux_session_id = get_tmux_session_id() or ""
-    save_window_id(hook_data.session_id, window_id, app_path, tmux_session_id)
+    tmux_window_id, tmux_pane_id = get_tmux_window_pane_ids()
+    state = SessionState(
+        window_id=window_id,
+        app_path=app_path,
+        timestamp=0.0,
+        tmux_session_id=tmux_session_id,
+        tmux_window_id=tmux_window_id,
+        tmux_pane_id=tmux_pane_id,
+    )
+    save_session_state(hook_data.session_id, state)
 
 
 @handle_command_errors("notify")
@@ -120,18 +129,16 @@ def cmd_notify() -> None:
     """Send intelligent notification if user switched away from original window."""
     global _CURRENT_APP_PATH
     hook_data = HookData.from_stdin()
-    session_file = SESSION_DIR / hook_data.session_id
 
-    if check_deduplication(session_file):
+    if check_deduplication(hook_data.session_id):
         return
 
-    lines = session_file.read_text().strip().split("\n")
-    original_window_id = lines[0]
-    app_path = lines[1]
-    tmux_session_id = lines[3] if len(lines) > 3 else ""
+    state = load_session_state(hook_data.session_id)
+    original_window_id = state.window_id
+    tmux_session_id = state.tmux_session_id
 
     # Set global app path for error handling
-    _CURRENT_APP_PATH = app_path
+    _CURRENT_APP_PATH = state.app_path
 
     # Local notifications only in desktop mode
     if not is_remote_session():
@@ -212,21 +219,37 @@ class HookData:
             raise ValueError("Invalid JSON input from stdin") from err
 
 
-def check_deduplication(session_file: Path) -> bool:
-    """Check if notification should be deduplicated. Returns True if should skip."""
+def check_deduplication(session_id: str) -> bool:
+    """Check whether to skip this notification (called within 2s of prior).
+
+    Acquires an exclusive lock on the session file, reads SessionState,
+    compares timestamp, and updates it if outside the dedup window.
+    """
+    session_file = SESSION_DIR / session_id
     try:
         with open(session_file, "r+") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lines = f.read().strip().split("\n")
-            # Lines: [0]=window_id, [1]=app_name, [2]=timestamp, [3]=tmux_session_id (optional)
+            state = load_session_state(session_id)
             if (
-                time.time() - float(lines[2])
+                time.time() - state.timestamp
                 < NOTIFICATION_DEDUPLICATION_THRESHOLD_SECONDS
             ):
                 return True
-            tmux_id = lines[3] if len(lines) > 3 else ""
+            state.timestamp = time.time()
             f.seek(0)
-            f.write(f"{lines[0]}\n{lines[1]}\n{time.time()}\n{tmux_id}")
+            f.write(
+                json.dumps(
+                    {
+                        "version": SESSION_STATE_VERSION,
+                        "window_id": state.window_id,
+                        "app_path": state.app_path,
+                        "timestamp": state.timestamp,
+                        "tmux_session_id": state.tmux_session_id,
+                        "tmux_window_id": state.tmux_window_id,
+                        "tmux_pane_id": state.tmux_pane_id,
+                    }
+                )
+            )
             f.truncate()
             return False
     except BlockingIOError:
@@ -276,37 +299,6 @@ def send_local_notification_if_needed(
         message=message,
         focus_window_id=original_window_id,
     )
-
-
-def save_window_id(
-    session_id: str,
-    window_id: str,
-    app_path: str,
-    tmux_session_id: str = "",
-) -> None:
-    """Save window ID, app path, and tmux session ID to session file.
-
-    Deprecated: use save_session_state. Kept temporarily so cmd_init still
-    works during the multi-step refactor; removed in the cmd_init rewrite.
-    """
-    SESSION_DIR.mkdir(exist_ok=True)
-    session_file = SESSION_DIR / session_id
-    session_file.write_text(f"{window_id}\n{app_path}\n0\n{tmux_session_id}")
-    debug_log(
-        f"Session initialized: window_id={window_id}, app_path={app_path}, tmux={tmux_session_id}, session_file={session_file}"
-    )
-
-
-def load_window_id(session_id: str) -> str:
-    """Load window ID from session file.
-
-    Deprecated: use load_session_state.
-    """
-    session_file = SESSION_DIR / session_id
-    lines = session_file.read_text().strip().split("\n")
-    window_id = lines[0]
-    debug_log(f"Session restored: window_id={window_id}, session_file={session_file}")
-    return window_id
 
 
 @dataclass
@@ -505,6 +497,27 @@ def get_tmux_session_id() -> Optional[str]:
         return None
 
 
+def get_tmux_window_pane_ids() -> tuple[str, str]:
+    """Get the current tmux window id (@N) and pane id (%N).
+
+    Returns ("", "") if not in tmux.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{window_id}|#{pane_id}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0 or "|" not in result.stdout:
+            return ("", "")
+        window_id, pane_id = result.stdout.strip().split("|", 1)
+        debug_log(f"tmux window/pane: {window_id}/{pane_id}")
+        return (window_id, pane_id)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ("", "")
+
+
 def is_tmux_session_attached(session_id: str) -> bool:
     """Check if a tmux session is currently attached (has active clients).
 
@@ -685,12 +698,48 @@ def _normalize_tty(raw: str) -> Optional[str]:
     return f"/dev/{raw}"
 
 
+def _pid_tty(pid: int) -> Optional[str]:
+    """Return controlling TTY (normalized) for a pid, or None."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "tty=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            return _normalize_tty(result.stdout)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        debug_log(f"ps -o tty= failed for pid={pid}: {e}")
+    return None
+
+
+def _pid_children(pid: int) -> list[int]:
+    """Return list of child PIDs for a parent pid."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0:
+            return []
+        return [
+            int(line.strip())
+            for line in result.stdout.strip().splitlines()
+            if line.strip().isdigit()
+        ]
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        debug_log(f"pgrep -P failed for pid={pid}: {e}")
+        return []
+
+
 def walk_descendant_ttys(root_pid: int) -> set[str]:
     """Collect controlling TTYs of a process and all its descendants.
 
     Walks the process tree depth-first, bounded by PID_WALK_MAX_DEPTH to
-    avoid runaway recursion in pathological cases. Uses pgrep -P to find
-    children and ps -o tty= to read each PID's controlling TTY.
+    avoid runaway recursion in pathological cases.
     """
     ttys: set[str] = set()
     frontier: list[tuple[int, int]] = [(root_pid, 0)]
@@ -702,37 +751,16 @@ def walk_descendant_ttys(root_pid: int) -> set[str]:
             continue
         seen.add(pid)
 
-        try:
-            ps_result = subprocess.run(
-                ["ps", "-o", "tty=", "-p", str(pid)],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if ps_result.returncode == 0:
-                tty = _normalize_tty(ps_result.stdout)
-                if tty:
-                    ttys.add(tty)
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            debug_log(f"ps -o tty= failed for pid={pid}: {e}")
+        tty = _pid_tty(pid)
+        if tty:
+            ttys.add(tty)
 
         if depth >= PID_WALK_MAX_DEPTH:
             continue
 
-        try:
-            pgrep_result = subprocess.run(
-                ["pgrep", "-P", str(pid)],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if pgrep_result.returncode == 0:
-                for line in pgrep_result.stdout.strip().splitlines():
-                    line = line.strip()
-                    if line.isdigit():
-                        frontier.append((int(line), depth + 1))
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            debug_log(f"pgrep -P failed for pid={pid}: {e}")
+        frontier.extend(
+            (child_pid, depth + 1) for child_pid in _pid_children(pid)
+        )
 
     debug_log(f"Descendant TTYs for pid={root_pid}: {ttys}")
     return ttys
