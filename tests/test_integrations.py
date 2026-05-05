@@ -369,3 +369,129 @@ class TestWalkDescendantTtys:
             # If walk were unbounded this would never return.
             result = cc_notifier.walk_descendant_ttys(100)
             assert result == set()
+
+
+class TestDecideNotification:
+    """Exhaustive matrix over the notification decision."""
+
+    def _state(self, **overrides):
+        defaults = dict(
+            window_id="99",
+            app_path="/Applications/Ghostty.app",
+            timestamp=0.0,
+            tmux_session_id="$3",
+            tmux_window_id="@42",
+            tmux_pane_id="%87",
+        )
+        defaults.update(overrides)
+        return cc_notifier.SessionState(**defaults)
+
+    def test_no_clients_returns_push(self):
+        with patch("cc_notifier.tmux_list_clients", return_value=[]):
+            assert (
+                cc_notifier.decide_notification(self._state())
+                is cc_notifier.Decision.PUSH
+            )
+
+    def test_all_clients_idle_returns_push(self):
+        clients = [cc_notifier.ClientInfo(tty="/dev/ttys012", active=True)]
+        with (
+            patch("cc_notifier.tmux_list_clients", return_value=clients),
+            patch("cc_notifier.tty_atime_idle", return_value=120),
+        ):
+            assert (
+                cc_notifier.decide_notification(self._state())
+                is cc_notifier.Decision.PUSH
+            )
+
+    def test_active_focused_same_window_pane_returns_silent(self):
+        clients = [cc_notifier.ClientInfo(tty="/dev/ttys012", active=True)]
+        with (
+            patch("cc_notifier.tmux_list_clients", return_value=clients),
+            patch("cc_notifier.tty_atime_idle", return_value=2),
+            patch("cc_notifier.is_focused_ghostty_for_tty", return_value=True),
+            patch(
+                "cc_notifier.get_tmux_window_pane_ids",
+                return_value=("@42", "%87"),
+            ),
+        ):
+            assert (
+                cc_notifier.decide_notification(self._state())
+                is cc_notifier.Decision.SILENT
+            )
+
+    def test_active_focused_different_window_returns_local(self):
+        clients = [cc_notifier.ClientInfo(tty="/dev/ttys012", active=True)]
+        with (
+            patch("cc_notifier.tmux_list_clients", return_value=clients),
+            patch("cc_notifier.tty_atime_idle", return_value=2),
+            patch("cc_notifier.is_focused_ghostty_for_tty", return_value=True),
+            patch(
+                "cc_notifier.get_tmux_window_pane_ids",
+                return_value=("@99", "%87"),
+            ),
+        ):
+            assert (
+                cc_notifier.decide_notification(self._state())
+                is cc_notifier.Decision.LOCAL
+            )
+
+    def test_active_focused_different_pane_returns_local(self):
+        clients = [cc_notifier.ClientInfo(tty="/dev/ttys012", active=True)]
+        with (
+            patch("cc_notifier.tmux_list_clients", return_value=clients),
+            patch("cc_notifier.tty_atime_idle", return_value=2),
+            patch("cc_notifier.is_focused_ghostty_for_tty", return_value=True),
+            patch(
+                "cc_notifier.get_tmux_window_pane_ids",
+                return_value=("@42", "%99"),
+            ),
+        ):
+            assert (
+                cc_notifier.decide_notification(self._state())
+                is cc_notifier.Decision.LOCAL
+            )
+
+    def test_active_not_focused_returns_local(self):
+        clients = [cc_notifier.ClientInfo(tty="/dev/ttys012", active=True)]
+        with (
+            patch("cc_notifier.tmux_list_clients", return_value=clients),
+            patch("cc_notifier.tty_atime_idle", return_value=2),
+            patch("cc_notifier.is_focused_ghostty_for_tty", return_value=False),
+        ):
+            assert (
+                cc_notifier.decide_notification(self._state())
+                is cc_notifier.Decision.LOCAL
+            )
+
+    def test_no_active_client_with_fresh_idle_returns_local(self):
+        """Attached but no client_active=1 — user is in tmux somewhere."""
+        clients = [cc_notifier.ClientInfo(tty="/dev/ttys012", active=False)]
+        with (
+            patch("cc_notifier.tmux_list_clients", return_value=clients),
+            patch("cc_notifier.tty_atime_idle", return_value=2),
+        ):
+            assert (
+                cc_notifier.decide_notification(self._state())
+                is cc_notifier.Decision.LOCAL
+            )
+
+    def test_legacy_state_no_window_pane_falls_through_to_local_when_focused(self):
+        """Pre-upgrade session lacks tmux_window_id/pane_id."""
+        clients = [cc_notifier.ClientInfo(tty="/dev/ttys012", active=True)]
+        with (
+            patch("cc_notifier.tmux_list_clients", return_value=clients),
+            patch("cc_notifier.tty_atime_idle", return_value=2),
+            patch("cc_notifier.is_focused_ghostty_for_tty", return_value=True),
+            patch(
+                "cc_notifier.get_tmux_window_pane_ids",
+                return_value=("@42", "%87"),
+            ),
+        ):
+            # state has empty window/pane → can't match → LOCAL
+            assert (
+                cc_notifier.decide_notification(
+                    self._state(tmux_window_id="", tmux_pane_id="")
+                )
+                is cc_notifier.Decision.LOCAL
+            )

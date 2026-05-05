@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -34,6 +35,7 @@ PUSH_IDLE_CHECK_INTERVALS_DESKTOP = [3, 20]
 PUSH_IDLE_CHECK_INTERVALS_REMOTE = [4]
 PUSH_IDLE_CHECK_INTERVALS_ATTACHED = [3, 20]
 PID_WALK_MAX_DEPTH = 6
+KEYBOARD_IDLE_THRESHOLD_SECONDS = 60
 
 # Debug configuration
 DEBUG = False
@@ -786,6 +788,50 @@ def is_focused_ghostty_for_tty(client_tty: str) -> bool:
         f"is_focused_ghostty_for_tty(pid={pid}, tty={client_tty}) = {result}"
     )
     return result
+
+
+class Decision(Enum):
+    SILENT = "silent"
+    LOCAL = "local"
+    PUSH = "push"
+
+
+def decide_notification(state: SessionState) -> Decision:
+    """Decide which notification (if any) to send for this hook event.
+
+    Outcomes are mutually exclusive:
+      SILENT — user is at the keyboard AND focused on the originating
+               tmux pane in the originating window.
+      LOCAL  — user is at the keyboard somewhere else (different tmux
+               window/session, different macOS window, etc.).
+      PUSH   — user is away (no clients attached, or all attached
+               clients have been keyboard-idle for >= 60s).
+    """
+    clients = tmux_list_clients(state.tmux_session_id)
+    if not clients:
+        debug_log("decide: no clients attached -> PUSH")
+        return Decision.PUSH
+
+    min_idle = min(tty_atime_idle(c.tty) for c in clients)
+    if min_idle >= KEYBOARD_IDLE_THRESHOLD_SECONDS:
+        debug_log(f"decide: all clients idle (min={min_idle}s) -> PUSH")
+        return Decision.PUSH
+
+    active_client = next((c for c in clients if c.active), None)
+    if active_client and is_focused_ghostty_for_tty(active_client.tty):
+        if state.tmux_window_id and state.tmux_pane_id:
+            current_window, current_pane = get_tmux_window_pane_ids()
+            if (
+                current_window == state.tmux_window_id
+                and current_pane == state.tmux_pane_id
+            ):
+                debug_log("decide: focused on originating pane -> SILENT")
+                return Decision.SILENT
+        debug_log("decide: focused but different pane/legacy state -> LOCAL")
+        return Decision.LOCAL
+
+    debug_log("decide: keyboard fresh but not focused here -> LOCAL")
+    return Decision.LOCAL
 
 
 # ============================================================================
