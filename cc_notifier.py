@@ -466,6 +466,59 @@ def is_tmux_session_attached(session_id: str) -> bool:
         return False
 
 
+@dataclass
+class ClientInfo:
+    """A tmux client attached to a session."""
+
+    tty: str
+    active: bool
+
+
+def tmux_list_clients(session_id: str) -> list[ClientInfo]:
+    """List tmux clients attached to a given session.
+
+    Uses client_tty + client_active. client_activity is intentionally NOT
+    used — it tracks I/O including process output, so it stays fresh while
+    Claude streams tokens even when the user has walked away. TTY atime
+    (only advances on read from the kernel, i.e. keyboard/mouse input)
+    is the correct presence signal.
+
+    Returns:
+        List of ClientInfo. Empty list if tmux is missing, the session
+        is gone, or no clients are attached.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "list-clients",
+                "-t",
+                session_id,
+                "-F",
+                "#{client_tty}|#{client_active}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0:
+            debug_log(
+                f"tmux list-clients returned {result.returncode} for {session_id}"
+            )
+            return []
+        clients: list[ClientInfo] = []
+        for line in result.stdout.strip().splitlines():
+            if "|" not in line:
+                continue
+            tty, active = line.split("|", 1)
+            clients.append(ClientInfo(tty=tty, active=active == "1"))
+        debug_log(f"tmux clients for {session_id}: {clients}")
+        return clients
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        debug_log(f"tmux list-clients error: {type(e).__name__}: {e}")
+        return []
+
+
 # ============================================================================
 # HAMMERSPOON INTEGRATION - Cross-Space Window Management
 # ============================================================================

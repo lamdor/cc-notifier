@@ -177,3 +177,51 @@ class TestNotificationSystemIntegration:
             content = log_file.read_text()
             assert "Test error" in content
             assert "ValueError: test" in content
+
+
+class TestTmuxListClients:
+    """Test tmux_list_clients parsing."""
+
+    def test_returns_empty_list_when_session_missing(self):
+        """No clients attached -> empty list."""
+        with patch("cc_notifier.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = ""
+            result = cc_notifier.tmux_list_clients("$3")
+            assert result == []
+
+    def test_parses_single_attached_client(self):
+        """One client, active=1."""
+        with patch("cc_notifier.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "/dev/ttys012|1\n"
+            result = cc_notifier.tmux_list_clients("$3")
+            assert len(result) == 1
+            assert result[0].tty == "/dev/ttys012"
+            assert result[0].active is True
+
+    def test_parses_multiple_clients_mixed_active(self):
+        """Two clients, only one active for this session."""
+        with patch("cc_notifier.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "/dev/ttys012|1\n/dev/ttys020|0\n"
+            result = cc_notifier.tmux_list_clients("$3")
+            assert len(result) == 2
+            assert result[0].active is True
+            assert result[1].active is False
+
+    def test_returns_empty_on_tmux_failure(self):
+        """tmux not running or session vanished -> empty list."""
+        with patch("cc_notifier.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            mock_run.return_value.stdout = ""
+            result = cc_notifier.tmux_list_clients("$3")
+            assert result == []
+
+    def test_returns_empty_when_tmux_not_found(self):
+        """tmux binary missing -> empty list."""
+        with patch(
+            "cc_notifier.subprocess.run", side_effect=FileNotFoundError()
+        ):
+            result = cc_notifier.tmux_list_clients("$3")
+            assert result == []
