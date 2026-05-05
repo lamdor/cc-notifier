@@ -284,7 +284,11 @@ def save_window_id(
     app_path: str,
     tmux_session_id: str = "",
 ) -> None:
-    """Save window ID, app path, and tmux session ID to session file."""
+    """Save window ID, app path, and tmux session ID to session file.
+
+    Deprecated: use save_session_state. Kept temporarily so cmd_init still
+    works during the multi-step refactor; removed in the cmd_init rewrite.
+    """
     SESSION_DIR.mkdir(exist_ok=True)
     session_file = SESSION_DIR / session_id
     session_file.write_text(f"{window_id}\n{app_path}\n0\n{tmux_session_id}")
@@ -294,12 +298,78 @@ def save_window_id(
 
 
 def load_window_id(session_id: str) -> str:
-    """Load window ID from session file."""
+    """Load window ID from session file.
+
+    Deprecated: use load_session_state.
+    """
     session_file = SESSION_DIR / session_id
     lines = session_file.read_text().strip().split("\n")
     window_id = lines[0]
     debug_log(f"Session restored: window_id={window_id}, session_file={session_file}")
     return window_id
+
+
+@dataclass
+class SessionState:
+    """Persisted state for a Claude Code session."""
+
+    window_id: str
+    app_path: str
+    timestamp: float
+    tmux_session_id: str
+    tmux_window_id: str  # e.g. "@42"; empty if not in tmux
+    tmux_pane_id: str  # e.g. "%87"; empty if not in tmux
+
+
+SESSION_STATE_VERSION = 2
+
+
+def save_session_state(session_id: str, state: SessionState) -> None:
+    """Write SessionState to the session file as JSON."""
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    session_file = SESSION_DIR / session_id
+    payload = {
+        "version": SESSION_STATE_VERSION,
+        "window_id": state.window_id,
+        "app_path": state.app_path,
+        "timestamp": state.timestamp,
+        "tmux_session_id": state.tmux_session_id,
+        "tmux_window_id": state.tmux_window_id,
+        "tmux_pane_id": state.tmux_pane_id,
+    }
+    session_file.write_text(json.dumps(payload))
+    debug_log(f"Session saved: {session_id} -> {payload}")
+
+
+def load_session_state(session_id: str) -> SessionState:
+    """Read SessionState from the session file.
+
+    Falls back to the legacy 3- or 4-line text format for sessions that
+    were initialized before this version landed.
+    """
+    session_file = SESSION_DIR / session_id
+    raw = session_file.read_text()
+    try:
+        data = json.loads(raw)
+        return SessionState(
+            window_id=data.get("window_id", ""),
+            app_path=data.get("app_path", "UNKNOWN"),
+            timestamp=float(data.get("timestamp", 0)),
+            tmux_session_id=data.get("tmux_session_id", ""),
+            tmux_window_id=data.get("tmux_window_id", ""),
+            tmux_pane_id=data.get("tmux_pane_id", ""),
+        )
+    except (json.JSONDecodeError, ValueError, TypeError):
+        debug_log(f"Session {session_id}: parsing legacy format")
+        lines = raw.strip().split("\n")
+        return SessionState(
+            window_id=lines[0] if len(lines) > 0 else "",
+            app_path=lines[1] if len(lines) > 1 else "UNKNOWN",
+            timestamp=float(lines[2]) if len(lines) > 2 else 0.0,
+            tmux_session_id=lines[3] if len(lines) > 3 else "",
+            tmux_window_id="",
+            tmux_pane_id="",
+        )
 
 
 def cleanup_session(_: str) -> None:

@@ -1195,3 +1195,60 @@ class TestPushNotificationURL:
         assert "key=531915" in recovered_url
         assert "cmd=mosh" in recovered_url
         assert "/home/user/project" in recovered_url
+
+
+class TestSessionState:
+    """Test JSON session state with legacy fallback."""
+
+    def test_round_trip_json(self, tmp_path, monkeypatch):
+        """Save then load returns equivalent state."""
+        monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
+        state = cc_notifier.SessionState(
+            window_id="12345",
+            app_path="/Applications/Ghostty.app",
+            timestamp=1700000000.0,
+            tmux_session_id="$3",
+            tmux_window_id="@42",
+            tmux_pane_id="%87",
+        )
+        cc_notifier.save_session_state("abc", state)
+        loaded = cc_notifier.load_session_state("abc")
+        assert loaded == state
+
+    def test_loads_legacy_four_line_format(self, tmp_path, monkeypatch):
+        """Old session file (4 lines) loads with empty tmux window/pane."""
+        monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
+        legacy = tmp_path / "abc"
+        legacy.write_text("12345\n/Applications/Ghostty.app\n0\n$3")
+        loaded = cc_notifier.load_session_state("abc")
+        assert loaded.window_id == "12345"
+        assert loaded.app_path == "/Applications/Ghostty.app"
+        assert loaded.timestamp == 0.0
+        assert loaded.tmux_session_id == "$3"
+        assert loaded.tmux_window_id == ""
+        assert loaded.tmux_pane_id == ""
+
+    def test_loads_legacy_three_line_format(self, tmp_path, monkeypatch):
+        """Older session file with no tmux line at all."""
+        monkeypatch.setattr(cc_notifier, "SESSION_DIR", tmp_path)
+        legacy = tmp_path / "abc"
+        legacy.write_text("12345\n/Applications/Ghostty.app\n0")
+        loaded = cc_notifier.load_session_state("abc")
+        assert loaded.tmux_session_id == ""
+        assert loaded.tmux_window_id == ""
+        assert loaded.tmux_pane_id == ""
+
+    def test_save_creates_session_dir(self, tmp_path, monkeypatch):
+        """Save creates SESSION_DIR if missing."""
+        target = tmp_path / "subdir"
+        monkeypatch.setattr(cc_notifier, "SESSION_DIR", target)
+        state = cc_notifier.SessionState(
+            window_id="12345",
+            app_path="UNKNOWN",
+            timestamp=0.0,
+            tmux_session_id="",
+            tmux_window_id="",
+            tmux_pane_id="",
+        )
+        cc_notifier.save_session_state("xyz", state)
+        assert (target / "xyz").exists()
