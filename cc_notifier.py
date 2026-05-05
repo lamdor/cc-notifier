@@ -138,6 +138,12 @@ def cmd_notify() -> None:
     decision = decide_notification(state)
     debug_log(f"cmd_notify decision: {decision.value}")
 
+    # Remote mode has no local notifier — promote LOCAL to PUSH so the
+    # user gets at least a phone notification rather than nothing.
+    if decision is Decision.LOCAL and is_remote_session():
+        debug_log("Remote session: promoting LOCAL -> PUSH")
+        decision = Decision.PUSH
+
     if decision is Decision.SILENT:
         return
 
@@ -489,44 +495,49 @@ class ClientInfo:
 
 
 def tmux_list_clients(session_id: str) -> list[ClientInfo]:
-    """List tmux clients attached to a given session.
+    """List tmux clients currently displaying a given session.
 
-    Uses client_tty + client_active. client_activity is intentionally NOT
-    used — it tracks I/O including process output, so it stays fresh while
-    Claude streams tokens even when the user has walked away. TTY atime
-    (only advances on read from the kernel, i.e. keyboard/mouse input)
-    is the correct presence signal.
+    A tmux server has many clients, each currently attached to one session.
+    A client's `active` flag here means "this client is currently
+    displaying the target session" — derived by comparing the client's
+    current session_id against the requested session_id. When `active`
+    is True for a client, the user is looking at this session through
+    that client right now (not just attached to the server with this
+    session existing somewhere).
+
+    TTY atime (advances only on read from the kernel — keyboard/mouse
+    input) is what we use for presence; client_activity from tmux is
+    deliberately not used since it advances on output too.
 
     Returns:
-        List of ClientInfo. Empty list if tmux is missing, the session
-        is gone, or no clients are attached.
+        List of ClientInfo for every tmux client. The `active` flag
+        identifies clients currently displaying `session_id`.
+        Empty list if tmux is missing or has no clients.
     """
     try:
         result = subprocess.run(
             [
                 "tmux",
                 "list-clients",
-                "-t",
-                session_id,
                 "-F",
-                "#{client_tty}|#{client_active}",
+                "#{client_tty}|#{session_id}",
             ],
             capture_output=True,
             text=True,
             timeout=2,
         )
         if result.returncode != 0:
-            debug_log(
-                f"tmux list-clients returned {result.returncode} for {session_id}"
-            )
+            debug_log(f"tmux list-clients returned {result.returncode}")
             return []
         clients: list[ClientInfo] = []
         for line in result.stdout.strip().splitlines():
             if "|" not in line:
                 continue
-            tty, active = line.split("|", 1)
-            clients.append(ClientInfo(tty=tty, active=active == "1"))
-        debug_log(f"tmux clients for {session_id}: {clients}")
+            tty, client_session_id = line.split("|", 1)
+            clients.append(
+                ClientInfo(tty=tty, active=client_session_id == session_id)
+            )
+        debug_log(f"tmux clients (target session {session_id}): {clients}")
         return clients
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         debug_log(f"tmux list-clients error: {type(e).__name__}: {e}")

@@ -192,24 +192,33 @@ class TestTmuxListClients:
             assert result == []
 
     def test_parses_single_attached_client(self):
-        """One client, active=1."""
+        """One client currently on the target session -> active=True."""
         with patch("cc_notifier.subprocess.run") as mock_run:
             mock_run.return_value.returncode = 0
-            mock_run.return_value.stdout = "/dev/ttys012|1\n"
+            mock_run.return_value.stdout = "/dev/ttys012|$3\n"
             result = cc_notifier.tmux_list_clients("$3")
             assert len(result) == 1
             assert result[0].tty == "/dev/ttys012"
             assert result[0].active is True
 
     def test_parses_multiple_clients_mixed_active(self):
-        """Two clients, only one active for this session."""
+        """Two clients; only one currently displaying our target session."""
         with patch("cc_notifier.subprocess.run") as mock_run:
             mock_run.return_value.returncode = 0
-            mock_run.return_value.stdout = "/dev/ttys012|1\n/dev/ttys020|0\n"
+            mock_run.return_value.stdout = "/dev/ttys012|$3\n/dev/ttys020|$5\n"
             result = cc_notifier.tmux_list_clients("$3")
             assert len(result) == 2
             assert result[0].active is True
             assert result[1].active is False
+
+    def test_returns_clients_with_active_false_when_none_on_target(self):
+        """Clients exist but none currently displaying target session."""
+        with patch("cc_notifier.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "/dev/ttys012|$5\n/dev/ttys020|$7\n"
+            result = cc_notifier.tmux_list_clients("$3")
+            assert len(result) == 2
+            assert all(c.active is False for c in result)
 
     def test_returns_empty_on_tmux_failure(self):
         """tmux not running or session vanished -> empty list."""
