@@ -33,6 +33,7 @@ TERMINAL_NOTIFIER = "/opt/homebrew/bin/terminal-notifier"
 PUSH_IDLE_CHECK_INTERVALS_DESKTOP = [3, 20]
 PUSH_IDLE_CHECK_INTERVALS_REMOTE = [4]
 PUSH_IDLE_CHECK_INTERVALS_ATTACHED = [3, 20]
+PID_WALK_MAX_DEPTH = 6
 
 # Debug configuration
 DEBUG = False
@@ -579,6 +580,114 @@ for _,w in pairs(current) do
 end
 require('hs.notify').new({{title="cc-notifier", informativeText="Could not restore window focus. Try reopening your terminal or IDE.", soundName="Basso"}}):send()"""
     return [HAMMERSPOON_CLI, "-c", focus_script]
+
+
+def get_focused_window_pid() -> int:
+    """Get the PID of the application owning the focused macOS window.
+
+    Raises RuntimeError if Hammerspoon is missing or returns no window.
+    """
+    try:
+        output = run_command(
+            [
+                HAMMERSPOON_CLI,
+                "-c",
+                "local w=hs.window.focusedWindow(); "
+                "if w then local app=w:application(); "
+                "print(app and app:pid() or 'ERROR') "
+                "else print('ERROR') end",
+            ]
+        )
+        if output == "ERROR" or not output:
+            raise RuntimeError("Failed to get focused window PID from Hammerspoon")
+        return int(output.strip())
+    except (subprocess.TimeoutExpired, ValueError) as e:
+        raise RuntimeError(f"Hammerspoon PID lookup failed: {e}") from e
+
+
+def _normalize_tty(raw: str) -> Optional[str]:
+    """Normalize ps -o tty= output to a /dev/<name> path or None."""
+    raw = raw.strip()
+    if not raw or raw == "?" or raw == "??":
+        return None
+    if raw.startswith("/dev/"):
+        return raw
+    return f"/dev/{raw}"
+
+
+def walk_descendant_ttys(root_pid: int) -> set[str]:
+    """Collect controlling TTYs of a process and all its descendants.
+
+    Walks the process tree depth-first, bounded by PID_WALK_MAX_DEPTH to
+    avoid runaway recursion in pathological cases. Uses pgrep -P to find
+    children and ps -o tty= to read each PID's controlling TTY.
+    """
+    ttys: set[str] = set()
+    frontier: list[tuple[int, int]] = [(root_pid, 0)]
+    seen: set[int] = set()
+
+    while frontier:
+        pid, depth = frontier.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+
+        try:
+            ps_result = subprocess.run(
+                ["ps", "-o", "tty=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if ps_result.returncode == 0:
+                tty = _normalize_tty(ps_result.stdout)
+                if tty:
+                    ttys.add(tty)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            debug_log(f"ps -o tty= failed for pid={pid}: {e}")
+
+        if depth >= PID_WALK_MAX_DEPTH:
+            continue
+
+        try:
+            pgrep_result = subprocess.run(
+                ["pgrep", "-P", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if pgrep_result.returncode == 0:
+                for line in pgrep_result.stdout.strip().splitlines():
+                    line = line.strip()
+                    if line.isdigit():
+                        frontier.append((int(line), depth + 1))
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            debug_log(f"pgrep -P failed for pid={pid}: {e}")
+
+    debug_log(f"Descendant TTYs for pid={root_pid}: {ttys}")
+    return ttys
+
+
+def is_focused_ghostty_for_tty(client_tty: str) -> bool:
+    """Whether the focused macOS window's process tree owns client_tty.
+
+    True when the focused application's PID, or any descendant, has
+    client_tty as its controlling TTY. False on any failure (Hammerspoon
+    missing, ps/pgrep error, focused app isn't a terminal). False is the
+    conservative answer — callers send a local notification.
+    """
+    try:
+        pid = get_focused_window_pid()
+    except RuntimeError as e:
+        debug_log(f"is_focused_ghostty_for_tty: {e}")
+        return False
+
+    ttys = walk_descendant_ttys(pid)
+    result = client_tty in ttys
+    debug_log(
+        f"is_focused_ghostty_for_tty(pid={pid}, tty={client_tty}) = {result}"
+    )
+    return result
 
 
 # ============================================================================

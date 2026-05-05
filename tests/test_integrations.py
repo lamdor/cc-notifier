@@ -250,3 +250,122 @@ class TestTtyAtimeIdle:
         with patch("cc_notifier.os.stat", side_effect=PermissionError()):
             idle = cc_notifier.tty_atime_idle("/dev/ttys012")
             assert idle >= 10**8
+
+
+class TestIsFocusedGhostty:
+    """Test is_focused_ghostty_for_tty PID-walk logic."""
+
+    def test_returns_true_when_focused_pid_owns_client_tty(self):
+        """Focused window's process tree contains the client TTY."""
+        with (
+            patch("cc_notifier.get_focused_window_pid", return_value=999),
+            patch(
+                "cc_notifier.walk_descendant_ttys",
+                return_value={"/dev/ttys012", "/dev/ttys015"},
+            ),
+        ):
+            assert (
+                cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is True
+            )
+
+    def test_returns_false_when_client_tty_not_in_tree(self):
+        """Different Ghostty window has focus."""
+        with (
+            patch("cc_notifier.get_focused_window_pid", return_value=999),
+            patch(
+                "cc_notifier.walk_descendant_ttys",
+                return_value={"/dev/ttys020"},
+            ),
+        ):
+            assert (
+                cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
+            )
+
+    def test_returns_false_when_hammerspoon_fails(self):
+        """Hammerspoon error -> conservative LOCAL -> return False."""
+        with patch(
+            "cc_notifier.get_focused_window_pid",
+            side_effect=RuntimeError("no hs"),
+        ):
+            assert (
+                cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
+            )
+
+    def test_returns_false_when_no_descendants(self):
+        """Focused app isn't a terminal — empty TTY set."""
+        with (
+            patch("cc_notifier.get_focused_window_pid", return_value=999),
+            patch("cc_notifier.walk_descendant_ttys", return_value=set()),
+        ):
+            assert (
+                cc_notifier.is_focused_ghostty_for_tty("/dev/ttys012") is False
+            )
+
+
+class TestWalkDescendantTtys:
+    """Test process tree TTY collection."""
+
+    def test_collects_ttys_from_immediate_children(self):
+        """ps returns a TTY for the child PID, normalized."""
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            mock.returncode = 0
+            if cmd[0] == "pgrep":
+                pid = cmd[-1]
+                mock.stdout = "200\n" if pid == "100" else ""
+            elif cmd[0] == "ps":
+                pid = cmd[-1]
+                mock.stdout = "??" if pid == "100" else "ttys012"
+            return mock
+
+        with patch("cc_notifier.subprocess.run", side_effect=fake_run):
+            result = cc_notifier.walk_descendant_ttys(100)
+            assert "/dev/ttys012" in result
+
+    def test_normalizes_already_prefixed_paths(self):
+        """ps sometimes returns /dev/ttys012 already — don't double-prefix."""
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            mock.returncode = 0
+            if cmd[0] == "pgrep":
+                mock.stdout = ""
+            else:
+                mock.stdout = "/dev/ttys012"
+            return mock
+
+        with patch("cc_notifier.subprocess.run", side_effect=fake_run):
+            result = cc_notifier.walk_descendant_ttys(100)
+            assert result == {"/dev/ttys012"}
+
+    def test_skips_question_mark_tty(self):
+        """ps -o tty= returns '?' for processes with no controlling TTY."""
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            mock.returncode = 0
+            mock.stdout = "?" if cmd[0] == "ps" else ""
+            return mock
+
+        with patch("cc_notifier.subprocess.run", side_effect=fake_run):
+            result = cc_notifier.walk_descendant_ttys(100)
+            assert result == set()
+
+    def test_bounded_depth(self):
+        """Walk doesn't recurse forever — depth caps at PID_WALK_MAX_DEPTH."""
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            mock.returncode = 0
+            if cmd[0] == "pgrep":
+                parent = int(cmd[-1])
+                mock.stdout = f"{parent + 1}\n"
+            else:
+                mock.stdout = "?"
+            return mock
+
+        with patch("cc_notifier.subprocess.run", side_effect=fake_run):
+            # If walk were unbounded this would never return.
+            result = cc_notifier.walk_descendant_ttys(100)
+            assert result == set()
